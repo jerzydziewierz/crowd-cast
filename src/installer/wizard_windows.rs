@@ -245,7 +245,31 @@ fn run_app_picker(
     }
 
     let apps = list_windowed_apps();
-    let preselect: Vec<usize> = apps
+    // Saved apps that have no window right now. The picker used to build the dialog from
+    // live windows only and REPLACE the whole list with the visible checked rows on Save,
+    // so every whitelisted app that happened to be closed was silently deleted — the fleet
+    // sweep found 21 of 42 Windows participants with pruned whitelists, all feeding black
+    // video via blank_video_on_untracked_app (PDOOM-1397). Render them as extra
+    // pre-checked "(not running)" rows: they survive an untouched Save, and the user can
+    // finally SEE the full whitelist and deliberately un-tick an entry to remove it.
+    // Dedupe case-insensitively; keep the saved casing (matching is case-insensitive
+    // everywhere, so casing is cosmetic but stable).
+    let mut not_running: Vec<(String, String)> = Vec::new();
+    for saved in current_apps {
+        let has_row = apps.iter().any(|(_, exe)| exe.eq_ignore_ascii_case(saved));
+        let dup = not_running
+            .iter()
+            .any(|(_, exe)| exe.eq_ignore_ascii_case(saved));
+        if !has_row && !dup {
+            not_running.push((format!("{saved} (not running)"), saved.clone()));
+        }
+    }
+    let not_running_exes: Vec<String> = not_running.iter().map(|(_, exe)| exe.clone()).collect();
+    // One combined row list drives both rendering and the Save read-back, so checkbox
+    // indices stay aligned: windowed apps first (label-sorted), then the not-running tail.
+    let mut rows = apps;
+    rows.extend(not_running);
+    let preselect: Vec<usize> = rows
         .iter()
         .enumerate()
         .filter(|(_, (_, exe))| current_apps.iter().any(|t| t.eq_ignore_ascii_case(exe)))
@@ -292,7 +316,7 @@ fn run_app_picker(
         width: Some(px(430.0)),
         text: Some("Application".to_string()),
     });
-    for (label, _) in &apps {
+    for (label, _) in &rows {
         list.insert_item(label.as_str());
     }
 
@@ -368,12 +392,13 @@ fn run_app_picker(
         selected_apps: current_apps.to_vec(),
         autostart: autostart_initial,
     }));
-    let apps = Rc::new(apps);
+    let rows = Rc::new(rows);
     let window = Rc::new(window);
 
     let handler = {
         let out = outcome.clone();
-        let apps = apps.clone();
+        let rows = rows.clone();
+        let saved_apps: Vec<String> = current_apps.to_vec();
         nwg::full_bind_event_handler(&window.handle, move |evt, _data, handle| {
             use nwg::Event as E;
             match evt {
@@ -381,14 +406,42 @@ fn run_app_picker(
                 E::OnWindowClose => nwg::stop_thread_dispatch(),
                 E::OnButtonClick => {
                     if &handle == &save_btn {
+                        // Union of every checked row — live apps AND the not-running tail —
+                        // deduped case-insensitively. Reading only the live rows is what
+                        // silently pruned closed apps from the whitelist (PDOOM-1397).
                         let mut selected: Vec<String> = Vec::new();
                         if let Some(hwnd) = list.handle.hwnd() {
-                            for (i, (_, exe)) in apps.iter().enumerate() {
-                                if unsafe { lv::is_checked(hwnd, i) } {
+                            for (i, (_, exe)) in rows.iter().enumerate() {
+                                if unsafe { lv::is_checked(hwnd, i) }
+                                    && !selected.iter().any(|s| s.eq_ignore_ascii_case(exe))
+                                {
                                     selected.push(exe.clone());
                                 }
                             }
                         }
+                        // Diff against the saved list so a pruning regression is visible in
+                        // shipped logs without another fleet sweep (PDOOM-1397).
+                        let added: Vec<&str> = selected
+                            .iter()
+                            .filter(|s| !saved_apps.iter().any(|c| c.eq_ignore_ascii_case(s)))
+                            .map(String::as_str)
+                            .collect();
+                        let removed: Vec<&str> = saved_apps
+                            .iter()
+                            .filter(|c| !selected.iter().any(|s| s.eq_ignore_ascii_case(c)))
+                            .map(String::as_str)
+                            .collect();
+                        let kept_not_running: Vec<&str> = selected
+                            .iter()
+                            .filter(|s| {
+                                not_running_exes.iter().any(|n| n.eq_ignore_ascii_case(s))
+                            })
+                            .map(String::as_str)
+                            .collect();
+                        info!(
+                            "App picker saved: added={:?} removed={:?} kept_not_running={:?}",
+                            added, removed, kept_not_running
+                        );
                         let mut o = out.borrow_mut();
                         o.saved = true;
                         o.selected_apps = selected;
