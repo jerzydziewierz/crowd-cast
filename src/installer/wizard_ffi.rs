@@ -44,6 +44,10 @@ extern "C" {
     /// Set the list of available apps for selection
     fn wizard_set_apps(apps: *const WizardAppInfo, count: usize);
 
+    /// Seed the picker with the selection already saved in the config. Must be called
+    /// after `wizard_set_apps`, which clears the selection.
+    fn wizard_set_selection(apps: *const *const c_char, count: usize, capture_all: bool);
+
     /// Run the setup wizard (blocks until wizard closes)
     fn wizard_run(config: *mut WizardConfig) -> i32;
 
@@ -124,6 +128,26 @@ pub fn set_available_apps(apps: &[AppInfoWrapper]) {
     unsafe {
         wizard_set_apps(ffi_apps.as_ptr(), ffi_apps.len());
     }
+}
+
+/// Seed the wizard's app checklist with the selection the user already saved, so a re-run
+/// shows their actual state instead of an empty list. Whitelisted apps that aren't running
+/// get their own pre-ticked "(not running)" row, so the user can see and deliberately remove
+/// them rather than having them silently kept (or, on Linux, silently dropped).
+///
+/// Call this *after* [`set_available_apps`]: the native side clears the selection there.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn set_current_selection(apps: &[String], capture_all: bool) {
+    let c_apps: Vec<CString> = apps
+        .iter()
+        .filter_map(|s| CString::new(s.as_str()).ok())
+        .collect();
+    let ptrs: Vec<*const c_char> = c_apps.iter().map(|s| s.as_ptr()).collect();
+    unsafe {
+        wizard_set_selection(ptrs.as_ptr(), ptrs.len(), capture_all);
+    }
+    // `c_apps` must outlive the call; the native side copies each string.
+    drop(c_apps);
 }
 
 /// Run the native wizard and return the result
@@ -219,6 +243,9 @@ pub fn open_notifications_settings() {
 // Stubs for platforms without a native wizard (e.g. Windows)
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn set_available_apps(_apps: &[AppInfoWrapper]) {}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn set_current_selection(_apps: &[String], _capture_all: bool) {}
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn run_native_wizard(_autostart_default: bool) -> NativeWizardResult {

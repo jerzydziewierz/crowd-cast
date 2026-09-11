@@ -37,6 +37,15 @@ typedef struct {
 // count: Number of apps in the array
 void wizard_set_apps(const WizardAppInfo *apps, size_t count);
 
+// Seed the picker with the selection the user already saved, so a re-run of the wizard
+// shows their actual state instead of an empty checklist (a re-run then saving would
+// otherwise replace the whole whitelist with whatever happens to be ticked).
+// Whitelisted apps that aren't running get their own pre-ticked row, marked
+// "(not running)", so the user can see and deliberately remove them.
+// Must be called AFTER wizard_set_apps, which clears the selection.
+// apps: Array of bundle IDs; count: how many; capture_all: the saved full-screen setting
+void wizard_set_selection(const char *const *apps, size_t count, bool capture_all);
+
 // Run the setup wizard
 // config: Pointer to WizardConfig that will be filled with results
 // Returns: 0 on success, -1 on error
