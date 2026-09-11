@@ -18,6 +18,52 @@ static NSMutableArray<NSDictionary *> *g_available_apps = nil;
 static NSMutableSet<NSString *> *g_selected_apps = nil;
 static WizardConfig *g_config = nil;
 static BOOL g_wizard_running = NO;
+// Saved settings seeded by wizard_set_selection / wizard_run, read when the wizard builds
+// its checkboxes so a re-run reflects what the user actually has rather than defaults.
+static BOOL g_seed_capture_all = NO;
+static BOOL g_seed_autostart = YES;
+
+// Append a row for every whitelisted bundle ID that isn't in the available list (the app
+// isn't running). Without this the user cannot see their own whitelist: the entries are
+// preserved on save but invisible, so they can never deliberately remove one. Rows are
+// appended after the running apps and carry a "(not running)" marker.
+static void wizard_append_unlisted_apps(NSSet<NSString *> *selected) {
+    if (!g_available_apps || selected.count == 0) return;
+
+    NSMutableSet<NSString *> *listed = [[NSMutableSet alloc] init];
+    for (NSDictionary *app in g_available_apps) {
+        NSString *bundleId = app[@"bundle_id"];
+        if (bundleId) [listed addObject:bundleId];
+    }
+
+    NSMutableArray<NSString *> *missing = [NSMutableArray array];
+    for (NSString *bundleId in selected) {
+        if (![listed containsObject:bundleId]) [missing addObject:bundleId];
+    }
+    [missing sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+
+    for (NSString *bundleId in missing) {
+        // Resolve a human name from the installed bundle; fall back to the bundle ID for
+        // an app that has since been uninstalled.
+        NSString *name = nil;
+        NSURL *url = [[NSWorkspace sharedWorkspace] URLForApplicationWithBundleIdentifier:bundleId];
+        if (url) {
+            NSBundle *bundle = [NSBundle bundleWithURL:url];
+            name = bundle.infoDictionary[@"CFBundleDisplayName"] ?: bundle.infoDictionary[@"CFBundleName"];
+            if (name.length == 0) {
+                name = [[url lastPathComponent] stringByDeletingPathExtension];
+            }
+        }
+        if (name.length == 0) name = bundleId;
+
+        [g_available_apps addObject:@{
+            @"bundle_id": bundleId,
+            @"name": [NSString stringWithFormat:@"%@ (not running)", name],
+            @"pid": @(0),
+            @"not_running": @(YES),
+        }];
+    }
+}
 
 // ============================================================================
 // Wizard Window Controller
@@ -480,6 +526,8 @@ static BOOL g_wizard_running = NO;
     _captureAllCheckbox.font = [NSFont boldSystemFontOfSize:13];
     _captureAllCheckbox.target = self;
     _captureAllCheckbox.action = @selector(captureAllChanged:);
+    // Reflect the saved setting; a re-run must not silently flip the user back to per-app.
+    _captureAllCheckbox.state = g_seed_capture_all ? NSControlStateValueOn : NSControlStateValueOff;
     [_appSelectionView addSubview:_captureAllCheckbox];
     
     // Scroll view for app table
@@ -520,6 +568,9 @@ static BOOL g_wizard_running = NO;
     
     scrollView.documentView = _appTableView;
     [_appSelectionView addSubview:scrollView];
+
+    // Sync the table's enabled state and the description with the seeded checkbox above.
+    [self captureAllChanged:_captureAllCheckbox];
 }
 
 - (void)captureAllChanged:(id)sender {
@@ -574,6 +625,8 @@ static BOOL g_wizard_running = NO;
         field.editable = NO;
         field.drawsBackground = NO;
         field.font = [NSFont systemFontOfSize:12];
+        // Whitelisted but not running: greyed so it reads as "kept, not currently capturable".
+        field.textColor = [app[@"not_running"] boolValue] ? [NSColor secondaryLabelColor] : [NSColor labelColor];
         field.lineBreakMode = NSLineBreakByTruncatingTail;
         field.autoresizingMask = NSViewWidthSizable;
         [container addSubview:field];
@@ -685,7 +738,9 @@ static BOOL g_wizard_running = NO;
     _autostartCheckbox.buttonType = NSButtonTypeSwitch;
     _autostartCheckbox.title = @"Start crowd-cast on login";
     _autostartCheckbox.font = [NSFont boldSystemFontOfSize:13];
-    _autostartCheckbox.state = NSControlStateValueOn; // Default to on
+    // Seeded from the saved "start on login" preference (defaults on for a first run), so a
+    // re-opened wizard shows the user's actual state instead of silently re-enabling it.
+    _autostartCheckbox.state = g_seed_autostart ? NSControlStateValueOn : NSControlStateValueOff;
     [_autostartView addSubview:_autostartCheckbox];
     
     NSTextField *autostartDesc = [[NSTextField alloc] initWithFrame:NSMakeRect(140, 155, 280, 18)];
@@ -1026,6 +1081,23 @@ void wizard_set_apps(const WizardAppInfo *apps, size_t count) {
     }
 }
 
+void wizard_set_selection(const char *const *apps, size_t count, bool capture_all) {
+    if (!g_selected_apps) {
+        g_selected_apps = [[NSMutableSet alloc] init];
+    }
+    [g_selected_apps removeAllObjects];
+
+    for (size_t i = 0; i < count; i++) {
+        if (apps[i]) {
+            [g_selected_apps addObject:[NSString stringWithUTF8String:apps[i]]];
+        }
+    }
+    g_seed_capture_all = capture_all ? YES : NO;
+
+    // Give the apps that aren't running their own rows so the whole whitelist is visible.
+    wizard_append_unlisted_apps(g_selected_apps);
+}
+
 int wizard_run(WizardConfig *config) {
     if (g_wizard_running) {
         return -1;
@@ -1033,7 +1105,12 @@ int wizard_run(WizardConfig *config) {
     
     g_wizard_running = YES;
     g_config = config;
-    
+
+    // The caller seeds enable_autostart with the saved "start on login" preference; capture
+    // it before the reset below, so the checkbox can reflect the user's actual state rather
+    // than defaulting back on. (Mirrors wizard_run in src/ui/wizard_linux.c.)
+    g_seed_autostart = config->enable_autostart ? YES : NO;
+
     // Initialize config
     config->capture_all = false;
     config->enable_autostart = true;
@@ -1277,6 +1354,7 @@ void wizard_free_result(WizardConfig *config) {
         field.stringValue = app[@"name"] ?: @"Unknown";
         field.bezeled = NO; field.editable = NO; field.drawsBackground = NO;
         field.font = [NSFont systemFontOfSize:12];
+        field.textColor = [app[@"not_running"] boolValue] ? [NSColor secondaryLabelColor] : [NSColor labelColor];
         field.lineBreakMode = NSLineBreakByTruncatingTail;
         [container addSubview:field];
         return container;
@@ -1353,6 +1431,11 @@ void show_app_selection_panel(
         [g_available_apps sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
             return [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]];
         }];
+
+        // Whitelisted apps that aren't running are kept on save either way (the read-back
+        // below is the selection set, not the rows), but without a row the user cannot see
+        // or deliberately remove them. Append them after the running apps.
+        wizard_append_unlisted_apps(currentSet);
 
         AppSelectionPanelController *panel = [[AppSelectionPanelController alloc]
             initWithCurrentApps:currentSet captureAll:capture_all];
