@@ -169,6 +169,88 @@ pub struct MonitorFit {
     pub pos_y: f32,
 }
 
+/// A monitor as a full-display follow-focus target: the stable device name OBS's `monitor_id`
+/// setting keys on (the same value `MonitorCaptureSourceBuilder::set_monitor` writes at source
+/// creation, so retargeting and creation agree), and the scale that fits the monitor into the
+/// normalized canvas (1080 / its short edge).
+pub struct DisplayTarget {
+    pub device_name: String,
+    pub scale: f32,
+}
+
+fn display_target_for(monitor: &display_info::DisplayInfo) -> Option<DisplayTarget> {
+    let short = monitor.width.min(monitor.height);
+    (short > 0).then(|| DisplayTarget {
+        device_name: monitor.name.clone(),
+        scale: TARGET_SHORT_EDGE as f32 / short as f32,
+    })
+}
+
+/// The primary monitor as a target — where a freshly created display source points
+/// (`ScreenCaptureSource::new_display_capture`), so it is the placement to fit before any
+/// foreground window exists.
+pub fn primary_display_target() -> Option<DisplayTarget> {
+    let displays = display_info::DisplayInfo::all().ok()?;
+    displays
+        .iter()
+        .find(|display| display.is_primary)
+        .or_else(|| displays.first())
+        .and_then(display_target_for)
+}
+
+/// The monitor with this device name as a target — re-derives `scale` for the placement a display
+/// source is already on (used to retry a fit that never landed without moving the source).
+pub fn display_target_for_device(device_name: &str) -> Option<DisplayTarget> {
+    let displays = display_info::DisplayInfo::all().ok()?;
+    displays
+        .iter()
+        .find(|display| display.name == device_name)
+        .and_then(display_target_for)
+}
+
+fn matching_display_index(
+    monitor: (i32, i32, u32, u32),
+    displays: &[(i32, i32, u32, u32)],
+) -> Option<usize> {
+    displays.iter().position(|display| *display == monitor)
+}
+
+/// The monitor holding the foreground window as a target. The monitor comes from
+/// `MonitorFromWindow` (physical-pixel rect) and is matched to the `display-info` enumeration by
+/// its complete virtual-desktop rectangle, so two same-resolution monitors are told apart by
+/// position. `None` when there is no foreground window (login screen, desktop with nothing
+/// focused) or the rect matches no enumerated display (mid-topology-change) — the caller keeps
+/// its current placement.
+pub fn foreground_display_target() -> Option<DisplayTarget> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return None;
+    }
+    let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if hmon.is_null() {
+        return None;
+    }
+    let mut info = MonitorInfo {
+        cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+        rc_monitor: Rect::ZERO,
+        rc_work: Rect::ZERO,
+        dw_flags: 0,
+    };
+    if unsafe { GetMonitorInfoW(hmon, &mut info) } == 0 {
+        return None;
+    }
+    let rect = info.rc_monitor;
+    let width = (rect.right - rect.left).max(0) as u32;
+    let height = (rect.bottom - rect.top).max(0) as u32;
+    let displays = display_info::DisplayInfo::all().ok()?;
+    let signatures: Vec<_> = displays
+        .iter()
+        .map(|display| (display.x, display.y, display.width, display.height))
+        .collect();
+    let index = matching_display_index((rect.left, rect.top, width, height), &signatures)?;
+    display_target_for(&displays[index])
+}
+
 /// Among an app's candidate windows (their pixel sizes, topmost-first in Z-order),
 /// choose the index of the one the capture source is actually rendering.
 ///
@@ -469,5 +551,36 @@ mod select_capture_window_tests {
     fn empty_candidates_return_none() {
         assert_eq!(select_capture_window(&[], Some((100, 100))), None);
         assert_eq!(select_capture_window(&[], None), None);
+    }
+}
+
+#[cfg(test)]
+mod display_target_tests {
+    use super::matching_display_index;
+
+    #[test]
+    fn matches_monitor_by_complete_virtual_desktop_rectangle() {
+        let displays = [
+            (-1920, 0, 1920, 1080),
+            (0, 0, 2560, 1440),
+            (2560, -400, 1080, 1920),
+        ];
+        assert_eq!(
+            matching_display_index((2560, -400, 1080, 1920), &displays),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn same_resolution_monitor_at_another_origin_does_not_match() {
+        let displays = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
+        assert_eq!(
+            matching_display_index((1920, 0, 1920, 1080), &displays),
+            Some(1)
+        );
+        assert_eq!(
+            matching_display_index((-1920, 0, 1920, 1080), &displays),
+            None
+        );
     }
 }

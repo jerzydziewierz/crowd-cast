@@ -1047,6 +1047,7 @@ dependencies = [
  "chrono",
  "core-graphics",
  "directories",
+ "display-info",
  "ed25519-dalek",
  "embed-resource",
  "evdev",

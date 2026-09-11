@@ -23,6 +23,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -95,11 +96,14 @@ static const double kBlackFraction = 0.97;
 @end
 
 /*
- * Open a fresh SCK stream for `bundle_id` (or the main display when NULL / "__display__")
- * for up to `budget_secs`, and report what it saw. Blocks the calling thread for at most
- * roughly the budget; must not be called on the main thread.
+ * Open a fresh SCK stream for `bundle_id` (or a whole display when NULL / "__display__") for up
+ * to `budget_secs`, and report what it saw. `display_uuid` names the display the recording is
+ * currently pointed at (follow-focus moves it between monitors); the probe binds to that same
+ * display so it answers the same question as the recording. NULL / "" means the main display,
+ * the pre-follow-focus behaviour. Blocks the calling thread for at most roughly the budget; must
+ * not be called on the main thread.
  */
-int sck_probe_capture(const char *bundle_id, double budget_secs) {
+int sck_probe_capture(const char *bundle_id, const char *display_uuid, double budget_secs) {
     if (budget_secs <= 0.0 || budget_secs > 10.0) {
         budget_secs = 2.5;
     }
@@ -112,6 +116,13 @@ int sck_probe_capture(const char *bundle_id, double budget_secs) {
         NSString *b = [NSString stringWithUTF8String:bundle_id];
         if (b.length > 0 && ![b isEqualToString:@"__display__"]) {
             wantedBundle = b;
+        }
+    }
+    NSString *wantedDisplay = nil;
+    if (display_uuid != NULL) {
+        NSString *d = [NSString stringWithUTF8String:display_uuid];
+        if (d.length > 0) {
+            wantedDisplay = d;
         }
     }
 
@@ -132,7 +143,29 @@ int sck_probe_capture(const char *bundle_id, double budget_secs) {
         return SCK_PROBE_UNAVAILABLE;
     }
 
-    SCDisplay *display = content.displays.firstObject;
+    SCDisplay *display = nil;
+    if (wantedDisplay != nil) {
+        for (SCDisplay *candidate in content.displays) {
+            CFUUIDRef uuidRef = CGDisplayCreateUUIDFromDisplayID(candidate.displayID);
+            if (uuidRef == NULL) {
+                continue;
+            }
+            NSString *uuid = (__bridge_transfer NSString *)CFUUIDCreateString(NULL, uuidRef);
+            CFRelease(uuidRef);
+            if ([uuid caseInsensitiveCompare:wantedDisplay] == NSOrderedSame) {
+                display = candidate;
+                break;
+            }
+        }
+        if (display == nil) {
+            // The display the recording is pointed at is not in SCK's list (unplugged
+            // mid-flight, or SCK's enumeration lags a topology change). A stream of some OTHER
+            // display would answer a different question, so fail open.
+            return SCK_PROBE_UNAVAILABLE;
+        }
+    } else {
+        display = content.displays.firstObject;
+    }
     SCContentFilter *filter = nil;
     if (wantedBundle != nil) {
         SCRunningApplication *target = nil;

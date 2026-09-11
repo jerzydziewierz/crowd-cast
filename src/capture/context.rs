@@ -53,6 +53,12 @@ pub struct RecordingSession {
     pub start_time_ns: u64,
 }
 
+/// `last_display_uuid` slot for the single full-display source (no app identity). Distinct from
+/// every bundle id by construction; also what `active_display_uuid` reports for full-display
+/// recordings.
+#[cfg(target_os = "macos")]
+pub const DISPLAY_FOLLOW_KEY: &str = "__display__";
+
 /// Manages the embedded libobs context with screen capture and recording
 pub struct CaptureContext {
     /// The libobs context (None if not yet initialized)
@@ -345,14 +351,14 @@ impl CaptureContext {
 
         // macOS multi-monitor mode: the per-axis-max envelope of every display, each normalized
         // to a 1080px short edge (PIXELS — SCK reports backing pixels; see mac_geometry). Gated on
-        // the kill-switch flag AND single-active-app mode — matching the Linux gate and the
-        // apply_monitor_fit_to_active gate — because only the single-active path applies the
-        // compensating per-source transform (scale=norm). Display-capture / non-single-active
-        // sources carry no such transform, so they must keep the pre-feature main-display canvas
-        // (byte-identical) rather than a normalized canvas the source would overflow/crop. Falls
-        // through to the main-display resolution if the flag is off or enumeration fails.
+        // the kill-switch flag and used for either single-active app capture or full-display
+        // follow-focus. Both paths apply the compensating per-source transform (scale=norm).
+        // Legacy multi-source app capture keeps the pre-feature main-display canvas. Falls through
+        // to the main-display resolution if the flag is off or enumeration fails.
         #[cfg(target_os = "macos")]
-        if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
+        if self.mac_multi_monitor_enabled()
+            && (self.use_single_active_app_capture() || self.target_apps.is_empty())
+        {
             if let Some((w, h)) = super::mac_geometry::capture_canvas_size() {
                 debug!("macOS multi-monitor capture canvas: {}x{}", w, h);
                 // Output equals the normalized canvas — never cap the envelope. Capping it
@@ -830,6 +836,14 @@ impl CaptureContext {
         self.scene = None;
         self.app_scenes.clear();
         self.blank_scene = None;
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            self.last_monitor_fit = None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.last_display_uuid.clear();
+        }
         // Leaving per-app mode: drop the Mutter ScreenCast manager (closes its sessions).
         #[cfg(target_os = "linux")]
         {
@@ -1137,8 +1151,26 @@ impl CaptureContext {
         self.canvas_dims
     }
 
+    /// Whether full-display capture is transformed into the fixed normalized monitor envelope.
+    /// In this mode metadata must describe the canvas/output, not the source's native dimensions.
+    pub fn display_capture_uses_canvas_dimensions(&self) -> bool {
+        if !self.target_apps.is_empty() {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.mac_multi_monitor_enabled()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            true
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        false
+    }
+
     /// The canvas the CURRENT display set calls for, per the same gating as `initialize`/
-    /// `reset_video` (macOS multi-monitor + single-active only — `None` otherwise, or when
+    /// `reset_video` (macOS multi-monitor app/display follow-focus — `None` otherwise, or when
     /// enumeration fails). Lets the engine verify the in-use canvas still matches reality:
     /// during display-attach flux the DisplayMonitor's dims snapshot and the canvas
     /// computation can read a display's mode at different instants (observed live: a monitor
@@ -1147,7 +1179,9 @@ impl CaptureContext {
     /// expected vs actual closes every such divergence path.
     #[cfg(target_os = "macos")]
     pub fn expected_canvas(&self) -> Option<(u32, u32)> {
-        if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
+        if self.mac_multi_monitor_enabled()
+            && (self.use_single_active_app_capture() || self.target_apps.is_empty())
+        {
             super::mac_geometry::capture_canvas_size()
         } else {
             None
@@ -1156,7 +1190,7 @@ impl CaptureContext {
 
     /// Layout metadata for the segment: the display currently captured (which physical monitor
     /// the video shows) and the full monitor arrangement. `(None, empty)` when the macOS
-    /// multi-monitor path is inactive (flag off / non-macOS / not single-active).
+    /// multi-monitor path is inactive (flag off / non-macOS / legacy multi-source app mode).
     pub fn capture_layout_metadata(
         &self,
     ) -> (
@@ -1165,7 +1199,9 @@ impl CaptureContext {
     ) {
         #[cfg(target_os = "macos")]
         {
-            if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
+            if self.mac_multi_monitor_enabled()
+                && (self.use_single_active_app_capture() || self.target_apps.is_empty())
+            {
                 let all = super::mac_geometry::describe_all_displays();
                 let active = self
                     .active_display_uuid()
@@ -1176,20 +1212,26 @@ impl CaptureContext {
         (None, Vec::new())
     }
 
-    /// UUID of the display the active app is currently captured on (macOS multi-monitor), for
-    /// reporting the active display and detecting a follow-focus switch (even between two
+    /// UUID of the display currently captured on macOS, for reporting the active display and
+    /// detecting a follow-focus switch (even between two
     /// same-resolution monitors). Prefers the retarget cache; before the first poll retargets
     /// (and right after a source rebuild, which clears the cache) the source is pinned to the
     /// main display, so we report the main display's UUID rather than nothing — this is the
     /// single source of truth shared by `capture_layout_metadata` and the re-emit change check,
     /// so they can never disagree. `None` when the multi-monitor path is inactive or no app is
-    /// active (blank scene).
+    /// active in app mode (blank scene).
     pub fn active_display_uuid(&self) -> Option<String> {
         #[cfg(target_os = "macos")]
         {
-            if self.mac_multi_monitor_enabled() && self.use_single_active_app_capture() {
-                let app = self.active_capture_app.as_ref()?;
-                return match self.last_display_uuid.get(app) {
+            if self.mac_multi_monitor_enabled()
+                && (self.use_single_active_app_capture() || self.target_apps.is_empty())
+            {
+                let key = if self.target_apps.is_empty() {
+                    DISPLAY_FOLLOW_KEY
+                } else {
+                    self.active_capture_app.as_deref()?
+                };
+                return match self.last_display_uuid.get(key) {
                     Some(uuid) => Some(uuid.clone()),
                     // Source is created pinned to the main display (see new_application_capture);
                     // report that until the first poll's fit retargets it.
@@ -1937,17 +1979,26 @@ impl CaptureContext {
         None
     }
 
+    /// Windows monitor fit + follow-focus for whichever mode is recording: single-active per-app
+    /// mode places the active app's window at its on-monitor position (`apply_app_monitor_fit`);
+    /// full-display mode (no target apps) fits the single monitor source
+    /// (`apply_display_follow_focus`). Safe to call every poll and right after a source rebuild
+    /// (rebuilds clear the fit cache, so the next call re-applies).
+    #[cfg(target_os = "windows")]
+    pub fn apply_monitor_fit_to_active(&mut self) {
+        if self.target_apps.is_empty() {
+            self.apply_display_follow_focus();
+        } else {
+            self.apply_app_monitor_fit();
+        }
+    }
+
     /// Apply the monitor-level fit to the active app's capture source: scale the
     /// window by its monitor's 1080-shortest-edge factor and place it at its real
     /// on-monitor position. Re-applied each poll so it tracks the window as it
     /// moves/resizes; de-duplicated so an unchanged transform is a no-op.
-    /// Windows-only; a no-op elsewhere (macOS captures the main display only).
     #[cfg(target_os = "windows")]
-    pub fn apply_monitor_fit_to_active(&mut self) {
-        use libobs_wrapper::enums::{obs_alignment, ObsBoundsType};
-        use libobs_wrapper::graphics::Vec2;
-        use libobs_wrapper::scenes::ObsTransformInfoBuilder;
-
+    fn apply_app_monitor_fit(&mut self) {
         let Some(app) = self.active_capture_app.clone() else {
             return;
         };
@@ -1973,25 +2024,116 @@ impl CaptureContext {
 
         // Explicit transform: no bounds, top-left aligned, scaled by the monitor
         // factor, positioned at the window's real on-monitor offset (in canvas px).
-        let info = ObsTransformInfoBuilder::new()
-            .set_pos(Vec2::new(fit.pos_x, fit.pos_y))
-            .set_scale(Vec2::new(fit.scale, fit.scale))
-            .set_alignment(obs_alignment::LEFT | obs_alignment::TOP)
-            .set_bounds_type(ObsBoundsType::None)
-            .build(0, 0);
-
         let applied = {
             let Some((scene, source)) = self.app_scenes.get(&app) else {
                 return;
             };
-            let ok = scene.set_transform_info(source.source(), &info).is_ok();
-            if ok {
-                Self::set_area_scale_filter(scene, source.source());
-            }
-            ok
+            Self::fit_source_to_canvas(scene, source.source(), fit.scale, (fit.pos_x, fit.pos_y))
         };
         if applied {
             self.last_monitor_fit = Some(key);
+        }
+    }
+
+    /// Windows full-display follow-focus: keep the single `monitor_capture` source on the monitor
+    /// holding the foreground window and fit it into the normalized envelope canvas (which is
+    /// what the Windows canvas is in every mode — `canvas_and_output_dimensions`). WGC is
+    /// re-pointed only when the monitor's stable device name changes (`update_display_capture`
+    /// dedups on it).
+    ///
+    /// No foreground window (login screen, desktop with nothing focused) keeps the current
+    /// placement. Before any fit has landed, that placement is the monitor the source is on (the
+    /// primary at creation), re-derived by device name so the first frame is already fitted
+    /// rather than drawn at native scale until a window takes focus.
+    ///
+    /// Louis's logic routed through the shared fit helper. Validated on hardware (PDOOM-1405):
+    /// 1920x1080 @150% primary + 3440x1440 @100% secondary, canvas 2580x1080 — WGC honours
+    /// `monitor_id` on `update_raw` (the retargeted pixels really change), the foreground
+    /// monitor rect matches the `display-info` enumeration across mixed DPI, and a rotation
+    /// mid-recording opens the next segment already fitted.
+    #[cfg(target_os = "windows")]
+    fn apply_display_follow_focus(&mut self) {
+        let capture_audio = self.recording_config.enable_audio;
+        let fit_pending = self.last_monitor_fit.is_none();
+        let Some(source) = self.capture_sources.first_mut() else {
+            return; // no display source yet
+        };
+        let previous = source.display_id().map(str::to_string);
+        let target = match super::window_geometry::foreground_display_target() {
+            Some(t) => t,
+            None => {
+                if !fit_pending {
+                    return; // placement kept, transform in place
+                }
+                let current = match previous.as_deref() {
+                    Some(name) => super::window_geometry::display_target_for_device(name),
+                    None => super::window_geometry::primary_display_target(),
+                };
+                match current {
+                    Some(t) => t,
+                    None => return,
+                }
+            }
+        };
+
+        // Retarget when the monitor changed. The fit cache is dropped only after a SUCCESSFUL
+        // retarget: a failed one leaves the source (and its still-correct transform) on the
+        // previous monitor, and the next poll retries.
+        if previous.as_deref() != Some(target.device_name.as_str()) {
+            if let Err(e) = source.update_display_capture(&target.device_name, capture_audio) {
+                debug!("Display follow-focus retarget failed: {}", e);
+                return;
+            }
+            info!(
+                "Display follow-focus: {} -> {} norm={:.3}",
+                previous.as_deref().unwrap_or("(initial)"),
+                target.device_name,
+                target.scale
+            );
+            self.last_monitor_fit = None;
+        }
+
+        let key = (
+            target.device_name.clone(),
+            target.scale.to_bits(),
+            0f32.to_bits(),
+            0f32.to_bits(),
+        );
+        if self.last_monitor_fit.as_ref() == Some(&key) {
+            return;
+        }
+        let applied = match (self.scene.as_ref(), self.capture_sources.first()) {
+            (Some(scene), Some(source)) => {
+                Self::fit_source_to_canvas(scene, source.source(), target.scale, (0.0, 0.0))
+            }
+            _ => false,
+        };
+        if applied {
+            debug!(
+                "Display fit: scale {:.3} pos (0,0) [{}]",
+                target.scale, target.device_name
+            );
+            self.last_monitor_fit = Some(key);
+        }
+    }
+
+    /// macOS multi-monitor fit + follow-focus for whichever mode is recording:
+    /// single-active per-app mode fits the active app's SCK Application source
+    /// (`apply_app_monitor_fit`); full-display mode (no target apps) fits the single display
+    /// source (`apply_display_follow_focus`). Both hand OBS a full-DISPLAY-sized frame, so both
+    /// use the same `scale = norm, pos = (0,0)` transform (`fit_source_to_canvas`) and both
+    /// retarget the source to the display holding the focused window. Gated on the kill-switch
+    /// flag; safe to call every poll and right after any source rebuild (rebuilds clear the dedup
+    /// caches, so the next call re-applies).
+    #[cfg(target_os = "macos")]
+    pub fn apply_monitor_fit_to_active(&mut self) {
+        if !self.mac_multi_monitor_enabled() {
+            return;
+        }
+        if self.use_single_active_app_capture() {
+            self.apply_app_monitor_fit();
+        } else if self.target_apps.is_empty() {
+            self.apply_display_follow_focus();
         }
     }
 
@@ -2010,17 +2152,9 @@ impl CaptureContext {
     /// frontmost); when it isn't, the current placement is kept to avoid churning as focus flicks
     /// to non-target apps, and the main display is the default only for the first placement.
     ///
-    /// De-duped via `last_monitor_fit`; gated on the kill-switch flag AND single-active mode; a
-    /// no-op until a scene exists. Safe to call every poll.
+    /// De-duped via `last_monitor_fit`; a no-op until a scene exists.
     #[cfg(target_os = "macos")]
-    pub fn apply_monitor_fit_to_active(&mut self) {
-        use libobs_wrapper::enums::{obs_alignment, ObsBoundsType};
-        use libobs_wrapper::graphics::Vec2;
-        use libobs_wrapper::scenes::ObsTransformInfoBuilder;
-
-        if !self.mac_multi_monitor_enabled() || !self.use_single_active_app_capture() {
-            return;
-        }
+    fn apply_app_monitor_fit(&mut self) {
         let Some(app) = self.active_capture_app.clone() else {
             return;
         };
@@ -2081,19 +2215,9 @@ impl CaptureContext {
         if self.last_monitor_fit.as_ref() == Some(&key) {
             return;
         }
-        let info = ObsTransformInfoBuilder::new()
-            .set_pos(Vec2::new(0.0, 0.0))
-            .set_scale(Vec2::new(norm, norm))
-            .set_alignment(obs_alignment::LEFT | obs_alignment::TOP)
-            .set_bounds_type(ObsBoundsType::None)
-            .build(0, 0);
         let applied = match self.app_scenes.get(&app) {
             Some((scene, source)) => {
-                let ok = scene.set_transform_info(source.source(), &info).is_ok();
-                if ok {
-                    Self::set_area_scale_filter(scene, source.source());
-                }
-                ok
+                Self::fit_source_to_canvas(scene, source.source(), norm, (0.0, 0.0))
             }
             None => false,
         };
@@ -2104,6 +2228,118 @@ impl CaptureContext {
             );
             self.last_monitor_fit = Some(key);
         }
+    }
+
+    /// macOS full-display follow-focus: keep the single display source on the display holding
+    /// the frontmost app's focused window, fitted into the normalized canvas exactly like the
+    /// per-app path (SCK Display capture also hands us the display's full pixel frame). The
+    /// canvas is fixed for the session, so a switch never touches the encoder or the video
+    /// dimensions; only the SCStream restarts, deduped on the display UUID so an unchanged
+    /// display never restarts it.
+    ///
+    /// Target resolution, in order: the frontmost app's focused window → its display. When no
+    /// window resolves (no frontmost app right after login, every window minimized, a transient
+    /// Space gap) the current placement is kept — or, before any placement exists, the MAIN
+    /// display is used: a freshly built source is pinned to main and would otherwise sit
+    /// untransformed in the envelope (cropped on a 4K/5K main, undersized on a small one) until
+    /// the first window resolves. A kept placement whose transform never landed
+    /// (`last_monitor_fit` is None after a failed apply) is re-derived from its UUID so the fit
+    /// is retried instead of left missing.
+    #[cfg(target_os = "macos")]
+    fn apply_display_follow_focus(&mut self) {
+        let current = self.last_display_uuid.get(DISPLAY_FOLLOW_KEY).cloned();
+        let resolved =
+            get_frontmost_app().and_then(|f| super::mac_geometry::window_display_for_pid(f.pid));
+        let target = match (resolved, current.as_deref()) {
+            (Some(t), _) => t,
+            (None, Some(uuid)) => {
+                if self.last_monitor_fit.is_some() {
+                    return; // placement kept, transform in place
+                }
+                match super::mac_geometry::display_target_for_uuid(uuid) {
+                    Some(t) => t,
+                    None => return,
+                }
+            }
+            (None, None) => match super::mac_geometry::main_display_target() {
+                Some(t) => t,
+                None => return,
+            },
+        };
+
+        // Retarget when the display changed. The fit cache is dropped only after a SUCCESSFUL
+        // retarget: a failed one leaves the source (and its still-correct transform) on the
+        // previous display, and the next poll retries.
+        if current.as_deref() != Some(target.uuid.as_str()) {
+            let capture_audio = self.recording_config.enable_audio;
+            let Some(source) = self.capture_sources.first_mut() else {
+                return; // no display source yet
+            };
+            if let Err(e) = source.update_display_capture(&target.uuid, capture_audio) {
+                debug!("Display follow-focus retarget failed: {}", e);
+                return;
+            }
+            info!(
+                "Display follow-focus: {} -> {} norm={:.3} [display {}]",
+                current.as_deref().unwrap_or("(initial)"),
+                target.uuid,
+                target.norm,
+                target.id
+            );
+            self.last_display_uuid
+                .insert(DISPLAY_FOLLOW_KEY.to_string(), target.uuid.clone());
+            self.last_monitor_fit = None;
+        }
+
+        let key = (
+            DISPLAY_FOLLOW_KEY.to_string(),
+            target.norm.to_bits(),
+            0f32.to_bits(),
+            0f32.to_bits(),
+        );
+        if self.last_monitor_fit.as_ref() == Some(&key) {
+            return;
+        }
+        let applied = match (self.scene.as_ref(), self.capture_sources.first()) {
+            (Some(scene), Some(source)) => {
+                Self::fit_source_to_canvas(scene, source.source(), target.norm, (0.0, 0.0))
+            }
+            _ => false,
+        };
+        if applied {
+            debug!(
+                "Display fit: scale {:.3} pos (0,0) [display {}]",
+                target.norm, target.id
+            );
+            self.last_monitor_fit = Some(key);
+        }
+    }
+
+    /// Land a monitor-fit transform on a scene item: `scale` on both axes, top-left corner at
+    /// `pos` (canvas px), no bounds, plus the area-sample downscale filter. Shared by every
+    /// fit path so they cannot drift apart. Returns whether the transform landed.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn fit_source_to_canvas(
+        scene: &ObsSceneRef,
+        source: &libobs_wrapper::sources::ObsSourceRef,
+        scale: f32,
+        pos: (f32, f32),
+    ) -> bool {
+        use libobs_wrapper::enums::{obs_alignment, ObsBoundsType};
+        use libobs_wrapper::graphics::Vec2;
+        use libobs_wrapper::scenes::ObsTransformInfoBuilder;
+
+        let info = ObsTransformInfoBuilder::new()
+            .set_pos(Vec2::new(pos.0, pos.1))
+            .set_scale(Vec2::new(scale, scale))
+            .set_alignment(obs_alignment::LEFT | obs_alignment::TOP)
+            .set_bounds_type(ObsBoundsType::None)
+            .build(0, 0);
+        let ok = scene.set_transform_info(source, &info).is_ok();
+        if ok {
+            Self::set_area_scale_filter(scene, source);
+        }
+        ok
     }
 
     /// No-op on platforms without per-monitor fit (Windows, Linux, and macOS all have real

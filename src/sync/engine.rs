@@ -348,7 +348,6 @@ const BLIND_PROBE_STANDDOWN: Duration = Duration::from_secs(300);
 #[cfg(all(target_os = "macos", not(no_tray)))]
 const BLIND_ALERT_AFTER: Duration = Duration::from_secs(180);
 
-
 /// How recent an input event must be for "the user is actively working" to hold. This is the
 /// gate that keeps a locked screen, a stepped-away machine or an about-to-idle session from
 /// ever escalating: no input, no restart.
@@ -457,13 +456,19 @@ fn sck_probe_verdict(raw: std::os::raw::c_int) -> SckProbeVerdict {
 }
 
 /// Run the second-opinion probe for `key` (an app bundle id, or the whole display for
-/// `__display__`). Blocks the engine thread for up to ~2.5s — only called at escalation
-/// decisions, which are rare by construction.
+/// `__display__`) on `display_uuid` — the display the recording is currently pointed at (the
+/// per-app and full-display follow-focus paths move it between monitors; `None` = main display,
+/// which is also where a recording sits when the multi-monitor path is off). Probing the same
+/// display the recording captures is what makes the verdict comparable: a fresh stream of a
+/// DIFFERENT monitor seeing content says nothing about a black recording of this one. Blocks the
+/// engine thread for up to ~2.5s — only called at escalation decisions, which are rare by
+/// construction.
 #[cfg(all(target_os = "macos", not(no_tray)))]
-fn run_sck_probe(key: &str) -> SckProbeVerdict {
+fn run_sck_probe(key: &str, display_uuid: Option<&str>) -> SckProbeVerdict {
     extern "C" {
         fn sck_probe_capture(
             bundle_id: *const std::os::raw::c_char,
+            display_uuid: *const std::os::raw::c_char,
             budget_secs: f64,
         ) -> std::os::raw::c_int;
     }
@@ -471,8 +476,40 @@ fn run_sck_probe(key: &str) -> SckProbeVerdict {
         Ok(c) => c,
         Err(_) => return SckProbeVerdict::Unavailable,
     };
-    let raw = unsafe { sck_probe_capture(c_key.as_ptr(), 2.5) };
+    let c_display = match display_uuid.map(std::ffi::CString::new) {
+        Some(Ok(c)) => Some(c),
+        Some(Err(_)) => return SckProbeVerdict::Unavailable,
+        None => None,
+    };
+    let display_ptr = c_display.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    let raw = unsafe { sck_probe_capture(c_key.as_ptr(), display_ptr, 2.5) };
     sck_probe_verdict(raw)
+}
+
+/// Segment-metadata dimensions, `(display_width/height, output_width/height)`. `source` is the
+/// captured display's raw size, `canvas` the OBS base canvas. With a normalized multi-monitor
+/// envelope the frame IS the canvas and the output equals it: an envelope is already in
+/// 1080-short-edge space, and re-capping a portrait-tall 1920x1920 envelope to 1080x1080 would
+/// describe a video that does not exist (OBS encodes canvas == output on every such path, see
+/// `CaptureContext::canvas_and_output_dimensions`). Without an envelope the raw display is
+/// reported and its output is 1080-capped, matching `calculate_output_dimensions`. An unreadable
+/// canvas (0x0) falls back to the raw display size.
+fn metadata_dimensions(
+    source: (u32, u32),
+    canvas: (u32, u32),
+    normalized_envelope: bool,
+) -> ((u32, u32), (u32, u32)) {
+    let frame = if normalized_envelope && canvas.0 > 0 && canvas.1 > 0 {
+        canvas
+    } else {
+        source
+    };
+    let output = if normalized_envelope {
+        frame
+    } else {
+        crate::capture::calculate_output_dimensions(frame.0, frame.1, 1080)
+    };
+    (frame, output)
 }
 
 #[cfg(any(all(target_os = "macos", not(no_tray)), target_os = "windows"))]
@@ -2529,7 +2566,8 @@ unintended app video."
             DeadSourceAction::Alert => {
                 // Same second opinion before bothering a human: if a fresh stream sees the
                 // same black the recording sees, the screen is genuinely black — no popup.
-                match run_sck_probe(&key) {
+                let probe_display = self.capture_ctx.active_display_uuid();
+                match run_sck_probe(&key, probe_display.as_deref()) {
                     SckProbeVerdict::Black => {
                         self.blind_since.remove(&key);
                         self.blind_probe_standdown
@@ -2598,7 +2636,8 @@ unintended app video."
                 // frames at all is the OS-wedge signature — restart once, then the popup's
                 // "restart your Mac" advice is actually right. Probe failure = fail open,
                 // proceed on the timer alone as before.
-                let verdict = run_sck_probe(&key);
+                let probe_display = self.capture_ctx.active_display_uuid();
+                let verdict = run_sck_probe(&key, probe_display.as_deref());
                 info!(
                     "Second-opinion capture probe for '{}': {:?} (recording {:.1}% black)",
                     key,
@@ -2887,17 +2926,17 @@ unintended app video."
         // Empty/None off the feature, so this is inert on other platforms / flag off.
         let (active_display, displays) = self.capture_ctx.capture_layout_metadata();
 
-        let (mut dw, mut dh) = self.display_resolution;
-        // When the macOS multi-monitor path is active, the recorded frame is the normalized
-        // envelope CANVAS, not the main display — report the true canvas as display_width/height.
-        if !displays.is_empty() {
-            let (cw, ch) = self.capture_ctx.canvas_dimensions();
-            if cw > 0 && ch > 0 {
-                dw = cw;
-                dh = ch;
-            }
-        }
-        let (ow, oh) = crate::capture::calculate_output_dimensions(dw, dh, 1080);
+        // The recorded frame is the normalized envelope CANVAS whenever a multi-monitor path is
+        // active — per-app follow-focus reports `displays`; full-display follow-focus (macOS with
+        // the flag on, Windows always) reports via `display_capture_uses_canvas_dimensions` —
+        // otherwise the raw main display. See `metadata_dimensions` for the output rule.
+        let normalized_envelope =
+            !displays.is_empty() || self.capture_ctx.display_capture_uses_canvas_dimensions();
+        let ((dw, dh), (ow, oh)) = metadata_dimensions(
+            self.display_resolution,
+            self.capture_ctx.canvas_dimensions(),
+            normalized_envelope,
+        );
         let (sw, sh) = self
             .capture_ctx
             .active_source_dimensions()
@@ -3755,8 +3794,10 @@ unintended app video."
                     // geometry from whatever window ends up bound. No-op elsewhere.
                     #[cfg(target_os = "windows")]
                     self.capture_ctx.apply_focused_window_to_active();
-                    // Track the active window's real on-monitor position/scale
-                    // (Windows monitor-level fit; no-op elsewhere).
+                    // Monitor fit + follow-focus for the active source: Windows/Linux place the
+                    // per-app window at its on-monitor position; macOS fits the per-app or the
+                    // full-display source into the canvas and retargets it to the display holding
+                    // the focused window.
                     self.capture_ctx.apply_monitor_fit_to_active();
                     self.check_display_changes().await;
                     self.graduate_upload_buffer();
@@ -3913,6 +3954,12 @@ unintended app video."
             should_capture,
             "Failed to switch active capture source before segment rotation",
         )?;
+        // Re-apply the monitor fit before the new segment's first frame. Deduped, so this is a
+        // no-op unless a source was rebuilt (rebuilds clear the fit cache) or focus moved to
+        // another display since the last poll — either way the segment must not open with an
+        // untransformed source.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        self.capture_ctx.apply_monitor_fit_to_active();
 
         // Increment segment index
         self.segment_index += 1;
@@ -4158,6 +4205,11 @@ unintended app video."
             should_capture,
             "Failed to initialize active capture source before recording start",
         )?;
+        // Fit the freshly built source before the first frame: a rebuilt display or app source is
+        // pinned to the main display and untransformed until this runs (see
+        // `apply_monitor_fit_to_active`), and the first poll tick is up to a second away.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        self.capture_ctx.apply_monitor_fit_to_active();
 
         // Generate a main session ID (persists across all segments)
         let main_session_id = uuid::Uuid::new_v4().to_string();
@@ -5658,5 +5710,40 @@ mod tests {
         assert_eq!(buffer.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod metadata_dimension_tests {
+    use super::metadata_dimensions;
+
+    #[test]
+    fn raw_display_is_reported_native_and_output_is_capped_to_1080() {
+        // Single 4K display, multi-monitor path off: the frame is the display itself and the
+        // encoder caps it to 1080p, so the metadata must say the same.
+        assert_eq!(
+            metadata_dimensions((3840, 2160), (3840, 2160), false),
+            ((3840, 2160), (1920, 1080))
+        );
+    }
+
+    #[test]
+    fn envelope_is_reported_as_the_canvas_and_never_recapped() {
+        // Landscape + portrait monitors: the envelope is a 1920x1920 square and OBS encodes
+        // exactly that. Capping to 1080 would describe a 1080x1080 video that does not exist.
+        assert_eq!(
+            metadata_dimensions((3840, 2160), (1920, 1920), true),
+            ((1920, 1920), (1920, 1920))
+        );
+    }
+
+    #[test]
+    fn unreadable_canvas_falls_back_to_the_display_size() {
+        // Canvas not yet known (0x0): report the display rather than a zero frame; output still
+        // follows the envelope rule because that is what OBS was configured with.
+        assert_eq!(
+            metadata_dimensions((2560, 1440), (0, 0), true),
+            ((2560, 1440), (2560, 1440))
+        );
     }
 }

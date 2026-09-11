@@ -19,6 +19,9 @@ use libobs_simple::sources::macos::{
 #[cfg(target_os = "macos")]
 use libobs_wrapper::data::ObsObjectUpdater;
 
+#[cfg(target_os = "windows")]
+use libobs_wrapper::data::ObsData;
+
 #[cfg(target_os = "linux")]
 use libobs_simple::sources::linux::{
     PipeWireDesktopCaptureSourceBuilder, PipeWireScreenCaptureSourceBuilder,
@@ -82,6 +85,10 @@ pub struct ScreenCaptureSource {
     /// next genuine focus change self-corrects it.
     #[cfg(target_os = "windows")]
     bound_hwnd: Option<isize>,
+    /// Windows monitor name currently selected by `monitor_capture`. OBS keys monitor sources by
+    /// this stable device name; retaining it avoids restarting WGC on every focus poll.
+    #[cfg(target_os = "windows")]
+    display_id: Option<String>,
 }
 
 impl ScreenCaptureSource {
@@ -181,6 +188,7 @@ impl ScreenCaptureSource {
             app_id: None,
             // Monitor capture is display-bound, never window-bound; follow-focus never touches it.
             bound_hwnd: None,
+            display_id: primary.map(|monitor| monitor.0.name.clone()),
         })
     }
 
@@ -366,6 +374,7 @@ impl ScreenCaptureSource {
             // Seed the follow-focus dedup key with the window we just bound, so the first poll
             // after creation only re-points if the foreground window is genuinely different.
             bound_hwnd: Some(hwnd),
+            display_id: None,
         })
     }
 
@@ -786,6 +795,58 @@ impl ScreenCaptureSource {
             "Updated display UUID for source '{}' to {}",
             self.name, display_uuid
         );
+        Ok(())
+    }
+
+    /// Re-point a macOS full-display source while preserving its display-capture settings.
+    #[cfg(target_os = "macos")]
+    pub fn update_display_capture(
+        &mut self,
+        display_uuid: &str,
+        capture_audio: bool,
+    ) -> Result<()> {
+        if self.display_uuid.as_deref() == Some(display_uuid) {
+            return Ok(());
+        }
+        ScreenCaptureSourceUpdater::create_update(self.source.runtime(), &mut self.source)
+            .context("Failed to create display source updater")?
+            .set_display_uuid(display_uuid)
+            .set_show_cursor(true)
+            .set_audio_capture(capture_audio)
+            .update()
+            .context("Failed to update display capture target")?;
+        self.display_uuid = Some(display_uuid.to_string());
+        debug!(
+            "Updated display capture '{}' to {}",
+            self.name, display_uuid
+        );
+        Ok(())
+    }
+
+    /// Windows: the monitor device name this `monitor_capture` source currently points at
+    /// (`None` only if no monitor could be enumerated at creation).
+    #[cfg(target_os = "windows")]
+    pub fn display_id(&self) -> Option<&str> {
+        self.display_id.as_deref()
+    }
+
+    /// Re-point a Windows monitor-capture source by its OBS/display-info device name. Deduped on
+    /// the current name, so an unchanged monitor never restarts WGC. `capture_audio` is accepted
+    /// for call-site symmetry with macOS; the Windows monitor source has no audio track.
+    #[cfg(target_os = "windows")]
+    pub fn update_display_capture(&mut self, display_id: &str, _capture_audio: bool) -> Result<()> {
+        if self.display_id.as_deref() == Some(display_id) {
+            return Ok(());
+        }
+        let mut data = ObsData::new(self.source.runtime())
+            .context("Failed to allocate monitor capture settings")?;
+        data.set_string("monitor_id", display_id)
+            .context("Failed to set monitor capture target")?;
+        self.source
+            .update_raw(data)
+            .context("Failed to update monitor capture target")?;
+        self.display_id = Some(display_id.to_string());
+        debug!("Updated monitor capture '{}' to {}", self.name, display_id);
         Ok(())
     }
 

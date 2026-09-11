@@ -200,6 +200,17 @@ pub fn main_display_target() -> Option<DisplayTarget> {
     display_target(CGDisplay::main().id)
 }
 
+/// The active display with this UUID as a retarget target — re-derives `norm` for a placement
+/// remembered only by UUID (the full-display follow-focus cache). `None` if no active display
+/// carries the UUID any more (unplugged since).
+pub fn display_target_for_uuid(uuid: &str) -> Option<DisplayTarget> {
+    CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|id| crate::capture::get_display_uuid(*id).as_deref() == Some(uuid))
+        .and_then(display_target)
+}
+
 /// The display whose bounds contain a global (points) coordinate.
 fn display_for_point(x: f64, y: f64) -> Option<u32> {
     unsafe {
