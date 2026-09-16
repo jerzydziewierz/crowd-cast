@@ -4945,23 +4945,51 @@ unintended app video."
             self.stop_recording().await.ok();
         }
 
-        match self.capture_ctx.reset_video_and_recreate_sources() {
+        let reset_ok = match self.capture_ctx.reset_video_and_recreate_sources() {
             Ok(()) => {
                 info!("Reset video and recreated sources");
                 if let Ok(res) = get_main_display_resolution() {
                     self.display_resolution = res;
                 }
+                true
             }
             Err(e) => {
                 error!("Failed to reset video: {}", e);
+                false
             }
-        }
+        };
 
+        let mut recording_restored = true;
         if restart_recording {
             if let Err(e) = self.start_recording().await {
                 error!("Failed to restart recording after display change: {}", e);
+                recording_restored = false;
             }
         }
+
+        // Windows: a failed in-place reinit wedges the OBS video pipeline. `obs_reset_video()`
+        // returning an error (its output/encoder was still active, e.g. a display flapping fast
+        // enough that the previous teardown had not finished) leaves the context in a state
+        // where every later `output.start()` fails — recording stays silently off indefinitely,
+        // through auto-start AND the tray button, until the process is manually restarted
+        // (PDOOM-1422: a 2-monitor sleep/DP bounce cost ~19h of recording, recovered instantly by
+        // a restart). A fresh process reliably clears it — the same cure the dead-source ladder
+        // uses (#134). Backoff-guarded (shared budget) so a still-flapping display re-firing this
+        // handler cannot restart-loop. macOS/Linux keep today's log-and-continue behaviour: the
+        // display-change path is stable there, so we do not perturb it (Windows-only by request).
+        #[cfg(target_os = "windows")]
+        if (!reset_ok || !recording_restored) && restart_allowed_with_backoff() {
+            error!(
+                "Display-change reinit failed to restore capture (reset_ok={reset_ok}, \
+                 recording_restored={recording_restored}); restarting for a fresh OBS context \
+                 (PDOOM-1422)"
+            );
+            self.input_backend.stop();
+            self.stop_recording().await.ok();
+            restart_process(); // spawns a replacement and exits — never returns
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = (reset_ok, recording_restored);
     }
 
     /// Handle idle timeout - pause recording when user is inactive
