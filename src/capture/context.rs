@@ -59,6 +59,13 @@ pub struct RecordingSession {
 #[cfg(target_os = "macos")]
 pub const DISPLAY_FOLLOW_KEY: &str = "__display__";
 
+/// Bundle id a parked capture source is pointed at (PDOOM-1421). Deliberately not installable:
+/// ScreenCaptureKit finds no running application for it, so the source's stream has nothing to
+/// deliver and its per-frame cost goes away. The source object itself stays alive and bound to
+/// its scene, which is what makes parking reversible without a create or a destroy.
+#[cfg(target_os = "macos")]
+const PARKED_BUNDLE_ID: &str = "dev.crowd-cast.parked.no-such-app";
+
 /// Manages the embedded libobs context with screen capture and recording
 pub struct CaptureContext {
     /// The libobs context (None if not yet initialized)
@@ -117,6 +124,15 @@ pub struct CaptureContext {
     restore_tokens: HashMap<String, String>,
     /// Whether macOS should keep only one tracked application's source active at a time
     single_active_app_capture: bool,
+    /// Whether to park the capture sources of apps that aren't frontmost (PDOOM-1421).
+    /// See `CaptureConfig::park_idle_capture_sources`.
+    park_idle_capture_sources: bool,
+    /// Apps whose source is currently parked (pointed at `PARKED_BUNDLE_ID`). Tracked so a
+    /// redundant park/unpark is skipped: `obs_source_update` restarts the SCStream, so
+    /// re-parking an already-parked source would churn it for nothing (same reasoning as the
+    /// idempotence guard in `update_display_uuid`).
+    #[cfg(target_os = "macos")]
+    parked_apps: HashSet<String>,
     /// Currently active application capture target when single-active mode is enabled
     active_capture_app: Option<String>,
     /// Windows/macOS monitor-level fit last applied to the active source, used to skip
@@ -253,6 +269,9 @@ impl CaptureContext {
             target_apps: Vec::new(),
             restore_tokens: HashMap::new(),
             single_active_app_capture: false,
+            park_idle_capture_sources: false,
+            #[cfg(target_os = "macos")]
+            parked_apps: HashSet::new(),
             active_capture_app: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             last_monitor_fit: None,
@@ -488,6 +507,21 @@ impl CaptureContext {
     /// Enable or disable the macOS single-active-app capture strategy.
     /// Linux per-app capture uses the single-active path whenever per-app capture is
     /// supported; there is no portal-backed multi-source Wayland mode.
+    pub fn set_park_idle_capture_sources(&mut self, enabled: bool) {
+        self.park_idle_capture_sources = enabled;
+    }
+
+    /// Whether idle-source parking is in effect: opt-in, macOS only, and meaningless unless
+    /// we're in single-active mode (that's the mode that creates a source per tracked app).
+    fn use_park_idle_capture_sources(&self) -> bool {
+        // `not(no_tray)` as well as macOS: the black-output ladder that would catch a stream
+        // coming back black after an unpark only exists on tray builds. Parking without that
+        // safety net would be an unmonitored change to the capture hot path, so it stays off.
+        cfg!(all(target_os = "macos", not(no_tray)))
+            && self.park_idle_capture_sources
+            && self.use_single_active_app_capture()
+    }
+
     pub fn set_single_active_app_capture(&mut self, enabled: bool) {
         self.single_active_app_capture = enabled;
     }
@@ -587,6 +621,102 @@ impl CaptureContext {
     fn activate_scene(scene: &mut ObsSceneRef) -> Result<()> {
         scene.set_to_channel(0).context("Failed to activate scene")
     }
+
+    /// Point a non-frontmost app's source at an uninstalled bundle id so ScreenCaptureKit has
+    /// no content to deliver to it (PDOOM-1421). Measured to take ~1.8 points of `replayd` CPU
+    /// off per parked source, and to be reversible with no recorded black frame.
+    ///
+    /// Never called for the frontmost app — see `park_other_sources`. A parked source keeps its
+    /// scene and its scene item, so `needs_scene_for_app` still reports false for it and the
+    /// late-app restart path (PDOOM-1414) is unaffected.
+    #[cfg(target_os = "macos")]
+    fn park_source(&mut self, app: &str) {
+        if self.parked_apps.contains(app) {
+            return;
+        }
+        let Some((_, source)) = self.app_scenes.get_mut(app) else {
+            return;
+        };
+        match source.update_application(PARKED_BUNDLE_ID) {
+            Ok(()) => {
+                self.parked_apps.insert(app.to_string());
+                debug!("Parked idle capture source for '{}'", app);
+            }
+            // Fail open: a source that won't park just keeps streaming, which is today's
+            // behaviour. Never let a parking failure take down capture.
+            Err(e) => warn!("Failed to park capture source for '{}': {}", app, e),
+        }
+    }
+
+    /// Point a parked source back at its real app. Returns whether an unpark actually happened,
+    /// so the caller can invalidate the black-output ladder's "this key has shown content"
+    /// memory — without that, a stream that comes back black after an unpark is still
+    /// remembered as healthy and the ladder never escalates (see the engine's
+    /// `blind_content_seen`).
+    #[cfg(target_os = "macos")]
+    fn unpark_source(&mut self, app: &str) -> bool {
+        if !self.parked_apps.contains(app) {
+            return false;
+        }
+        let Some((_, source)) = self.app_scenes.get_mut(app) else {
+            return false;
+        };
+        match source.update_application(app) {
+            Ok(()) => {
+                self.parked_apps.remove(app);
+                debug!("Unparked capture source for '{}'", app);
+                true
+            }
+            Err(e) => {
+                // Leaving it marked parked would strand it blank forever; clear the flag so the
+                // next switch retries, and report black-ladder invalidation anyway since the
+                // source's stream was disturbed.
+                self.parked_apps.remove(app);
+                warn!("Failed to unpark capture source for '{}': {}", app, e);
+                true
+            }
+        }
+    }
+
+    /// Park every tracked app's source except `keep` (pass `None` to park all of them, which is
+    /// what an idle pause wants — nothing is being recorded, so nothing needs a live stream).
+    #[cfg(target_os = "macos")]
+    fn park_other_sources(&mut self, keep: Option<&str>) {
+        if !self.use_park_idle_capture_sources() {
+            return;
+        }
+        let victims: Vec<String> = self
+            .app_scenes
+            .keys()
+            .filter(|app| Some(app.as_str()) != keep)
+            .cloned()
+            .collect();
+        for app in victims {
+            self.park_source(&app);
+        }
+    }
+
+    /// Park every source, including the frontmost one. For an idle pause: the output writes no
+    /// frames while paused, so every live stream is pure cost, and pauses can last all night.
+    /// Returns nothing — `resume_active_source` restores the frontmost one.
+    pub fn park_all_sources_for_pause(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if !self.use_park_idle_capture_sources() {
+                return;
+            }
+            self.park_other_sources(None);
+            let n = self.parked_apps.len();
+            if n > 0 {
+                info!("Parked {} capture source(s) for idle pause", n);
+            }
+        }
+    }
+
+    // Resume needs no counterpart to `park_all_sources_for_pause`: `resume_recording` re-targets
+    // the frontmost app through `switch_active_app_capture`, which unparks ahead of its
+    // unchanged-target early return. If the frontmost app is untracked on resume we show the
+    // blank scene anyway, and its source unparks whenever it next gets focus.
 
     fn update_capture_state_flags(&self) {
         if let Ok(mut state) = self.state.write() {
@@ -1743,6 +1873,20 @@ impl CaptureContext {
         }
 
         let next_app = active_app.map(|app| app.to_string());
+
+        // Unpark the incoming source BEFORE it goes on channel 0, so the channel never points at
+        // a parked (contentless) source. Costs a brief moment with two live streams; the
+        // alternative would record the park's blank for as long as the update takes.
+        //
+        // Ahead of the unchanged-target early return on purpose: an idle pause parks *every*
+        // source including the frontmost one, and resume re-targets the same app, so an unpark
+        // behind that return would leave the active source parked and record blank. Cheap when
+        // nothing is parked — `unpark_source` short-circuits on the `parked_apps` check.
+        #[cfg(target_os = "macos")]
+        if let Some(bundle_id) = next_app.as_deref() {
+            self.unpark_source(bundle_id);
+        }
+
         if self.active_capture_app == next_app {
             return Ok(false);
         }
@@ -1784,8 +1928,25 @@ impl CaptureContext {
         }
 
         self.active_capture_app = next_app;
+
+        // Park everything we're no longer showing. After activation, so the outgoing source is
+        // only disturbed once it is off channel 0 and nothing is compositing it.
+        #[cfg(target_os = "macos")]
+        {
+            let keep = self.active_capture_app.clone();
+            self.park_other_sources(keep.as_deref());
+        }
+
         self.update_capture_state_flags();
         Ok(true)
+    }
+
+    /// Whether idle-source parking is active, so the engine knows a successful switch may have
+    /// restarted the incoming app's stream and its black-output memory needs invalidating.
+    /// Gated to match its only caller — the black-output ladder exists on macOS tray builds only.
+    #[cfg(all(target_os = "macos", not(no_tray)))]
+    pub fn parks_idle_sources(&self) -> bool {
+        self.use_park_idle_capture_sources()
     }
 
     /// Force a refresh of the current application capture source.

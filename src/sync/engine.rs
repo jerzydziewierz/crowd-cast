@@ -1967,6 +1967,7 @@ unintended app video."
         self.capture_ctx
             .switch_active_app_capture(desired_target.as_deref())
             .map_err(|e| anyhow::anyhow!("{}: {}", reason, e))?;
+        self.invalidate_black_memory_after_switch(desired_target.as_deref());
 
         if desired_target.is_none() {
             self.clear_capture_watchdog();
@@ -2132,6 +2133,7 @@ unintended app video."
                 if switched {
                     info!("Applied active capture switch to {:?}", target_app);
                 }
+                self.invalidate_black_memory_after_switch(target_app.as_deref());
                 // A switch actually completed, so no window-less episode is parked anymore. Clear
                 // the once-per-episode warning latch; it is otherwise only reset when the SAME
                 // app's window returns, so an episode that ends by switching away would silence
@@ -2394,6 +2396,48 @@ unintended app video."
         // dead-capture machinery (auto-resume eligibility; see `capture_dead_paused`).
         self.capture_dead_paused = true;
         self.pause_recording();
+    }
+
+    /// Forget that `app` has ever shown content, after a switch that may have restarted its
+    /// ScreenCaptureKit stream (idle-source parking, PDOOM-1421).
+    ///
+    /// The black-output ladder only escalates while `!content_seen_since_sources_built`, and
+    /// `blind_content_seen` is otherwise cleared only on a full source rebuild. A source we park
+    /// and unpark is never rebuilt, so without this it stays remembered as healthy and a stream
+    /// that comes back black would get no second opinion, no self-restart and no prompt — the
+    /// watchdog would sleep through exactly the regression it exists to catch.
+    ///
+    /// Deliberately unconditional on whether an unpark actually happened: re-arming a key that
+    /// was already live only costs one probe, while missing one costs silent data loss.
+    fn invalidate_black_memory_after_switch(&mut self, app: Option<&str>) {
+        // Body gated, signature not, so the two call sites need no cfg of their own
+        // (`blind_content_seen` only exists on macOS tray builds).
+        #[cfg(all(target_os = "macos", not(no_tray)))]
+        {
+            if !self.capture_ctx.parks_idle_sources() {
+                return;
+            }
+            if let Some(app) = app {
+                // Forget that it worked, and drop any stale black clock so the 10s threshold is
+                // measured from the next reading rather than from before the disturbance.
+                let seen = self.blind_content_seen.remove(app);
+                let clock = self.blind_since.remove(app).is_some();
+                if seen || clock {
+                    debug!(
+                        "Re-armed black-output detection for '{}' (its stream may have restarted)",
+                        app
+                    );
+                }
+                // Deliberately NOT clearing `blind_alerted_keys` / `blind_restarted_keys`, even
+                // though the healthy-reading path above clears them alongside these two. Those
+                // two record what remediation this app has already had. Resetting them on every
+                // app switch would let a genuinely wedged app loop restart → switch → restart
+                // and never reach the reboot prompt at the top of the ladder. Re-arming
+                // *detection* is the goal here; forgetting the *response* is not.
+            }
+        }
+        #[cfg(not(all(target_os = "macos", not(no_tray))))]
+        let _ = app;
     }
 
     /// The black-output ladder (PDOOM-1298): recover from a capture source that is producing
@@ -4427,6 +4471,12 @@ unintended app video."
         // recording_start_ns, because OBS's clock advances while paused but the recording
         // file does not — without this, post-resume event timestamps drift ahead of the video.
         self.pause_start_ns = self.capture_ctx.get_video_frame_time().ok();
+
+        // A paused output writes no frames, so every live capture stream is pure cost — and an
+        // idle pause can last all night. Park all of them, frontmost included; resume re-targets
+        // through `switch_active_app_capture`, which unparks what it needs (PDOOM-1421). Same
+        // argument the black probe already makes for itself a few lines above.
+        self.capture_ctx.park_all_sources_for_pause();
 
         self.is_paused = true;
         self.capture_enabled = false;
