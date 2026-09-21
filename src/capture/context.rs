@@ -942,6 +942,15 @@ impl CaptureContext {
             self.app_scenes.len(),
             self.active_capture_app
         );
+        // Park everything that isn't the scene we just asserted. Without this a source build
+        // leaves every stream live until the first focus change, and when no tracked app is
+        // frontmost the blank scene is showing and *nothing* would ever park. Sources are
+        // rebuilt on every restart and on every display change, so that is the common case.
+        #[cfg(target_os = "macos")]
+        {
+            let keep = self.active_capture_app.clone();
+            self.park_other_sources(keep.as_deref());
+        }
         self.update_capture_state_flags();
         Ok(())
     }
