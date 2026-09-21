@@ -622,6 +622,20 @@ impl CaptureContext {
         scene.set_to_channel(0).context("Failed to activate scene")
     }
 
+    /// Drop every per-app scene, and forget which apps were parked along with them.
+    ///
+    /// The parking bookkeeping refers to *sources*, not to bundle ids: once the sources are gone
+    /// a freshly built one for the same app is not parked, however it was left before the
+    /// teardown. Keeping the old set would make `park_source` early-return on its
+    /// already-parked check and leave that new source streaming while recorded as parked -- the
+    /// stream cost comes back and no later park ever retries it. Pause, then plug a monitor in,
+    /// is the everyday way to hit that.
+    fn clear_app_scenes(&mut self) {
+        self.app_scenes.clear();
+        #[cfg(target_os = "macos")]
+        self.parked_apps.clear();
+    }
+
     /// Point a non-frontmost app's source at an uninstalled bundle id so ScreenCaptureKit has
     /// no content to deliver to it (PDOOM-1421). Measured to take ~1.8 points of `replayd` CPU
     /// off per parked source, and to be reversible with no recorded black frame.
@@ -745,7 +759,7 @@ impl CaptureContext {
 
         // Clean up all capture resources (both modes) to prevent cross-mode
         // leaks when switching between single-active and display/multi modes.
-        self.app_scenes.clear();
+        self.clear_app_scenes();
         self.blank_scene = None;
         // The per-app monitor-fit transform is de-duped via `last_monitor_fit` (keyed on app +
         // scale + pos). Clearing app_scenes destroys the scene items the transform was applied
@@ -973,7 +987,7 @@ impl CaptureContext {
         // leaks when switching between single-active and display/multi modes.
         self.capture_sources.clear();
         self.scene = None;
-        self.app_scenes.clear();
+        self.clear_app_scenes();
         self.blank_scene = None;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
@@ -1188,7 +1202,7 @@ impl CaptureContext {
         log_critical_operation("reset_video_and_recreate_sources: clearing sources");
         self.capture_sources.clear();
         self.scene = None;
-        self.app_scenes.clear();
+        self.clear_app_scenes();
         self.blank_scene = None;
 
         // Build new video info
@@ -1246,7 +1260,7 @@ impl CaptureContext {
         // Drop sources/scene/recording first to release OBS references.
         log_critical_operation("reinitialize_for_display_change: clearing capture_sources");
         self.capture_sources.clear();
-        self.app_scenes.clear();
+        self.clear_app_scenes();
         self.blank_scene = None;
         log_critical_operation("reinitialize_for_display_change: dropping scene");
         self.scene = None;
@@ -2601,7 +2615,7 @@ impl CaptureContext {
     /// Does not touch the OBS context.
     pub fn teardown_capture(&mut self) {
         self.capture_sources.clear();
-        self.app_scenes.clear();
+        self.clear_app_scenes();
         self.scene = None;
         self.blank_scene = None;
         // Closes the Mutter ScreenCast sessions backing any picker-free per-app nodes.
