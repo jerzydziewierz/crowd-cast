@@ -124,9 +124,6 @@ pub struct CaptureContext {
     restore_tokens: HashMap<String, String>,
     /// Whether macOS should keep only one tracked application's source active at a time
     single_active_app_capture: bool,
-    /// Whether to park the capture sources of apps that aren't frontmost (PDOOM-1421).
-    /// See `CaptureConfig::park_idle_capture_sources`.
-    park_idle_capture_sources: bool,
     /// Apps whose source is currently parked (pointed at `PARKED_BUNDLE_ID`). Tracked so a
     /// redundant park/unpark is skipped: `obs_source_update` restarts the SCStream, so
     /// re-parking an already-parked source would churn it for nothing (same reasoning as the
@@ -269,7 +266,6 @@ impl CaptureContext {
             target_apps: Vec::new(),
             restore_tokens: HashMap::new(),
             single_active_app_capture: false,
-            park_idle_capture_sources: false,
             #[cfg(target_os = "macos")]
             parked_apps: HashSet::new(),
             active_capture_app: None,
@@ -504,22 +500,15 @@ impl CaptureContext {
         self.black_probe_active = active;
     }
 
-    /// Enable or disable the macOS single-active-app capture strategy.
-    /// Linux per-app capture uses the single-active path whenever per-app capture is
-    /// supported; there is no portal-backed multi-source Wayland mode.
-    pub fn set_park_idle_capture_sources(&mut self, enabled: bool) {
-        self.park_idle_capture_sources = enabled;
-    }
-
-    /// Whether idle-source parking is in effect: opt-in, macOS only, and meaningless unless
-    /// we're in single-active mode (that's the mode that creates a source per tracked app).
-    fn use_park_idle_capture_sources(&self) -> bool {
-        // `not(no_tray)` as well as macOS: the black-output ladder that would catch a stream
-        // coming back black after an unpark only exists on tray builds. Parking without that
-        // safety net would be an unmonitored change to the capture hot path, so it stays off.
-        cfg!(all(target_os = "macos", not(no_tray)))
-            && self.park_idle_capture_sources
-            && self.use_single_active_app_capture()
+    /// Whether idle-source parking is in effect. It is how `single_active_app_capture` is
+    /// enforced on macOS, so it follows that setting rather than having one of its own, and is
+    /// meaningless outside it — single-active is the mode that creates a source per tracked app.
+    ///
+    /// Also requires `not(no_tray)`: the black-output ladder that would catch a stream coming
+    /// back black after an unpark only exists on tray builds, and parking without that safety
+    /// net would be an unmonitored change to the capture hot path.
+    pub fn parks_idle_sources(&self) -> bool {
+        cfg!(all(target_os = "macos", not(no_tray))) && self.use_single_active_app_capture()
     }
 
     pub fn set_single_active_app_capture(&mut self, enabled: bool) {
@@ -696,7 +685,7 @@ impl CaptureContext {
     /// what an idle pause wants — nothing is being recorded, so nothing needs a live stream).
     #[cfg(target_os = "macos")]
     fn park_other_sources(&mut self, keep: Option<&str>) {
-        if !self.use_park_idle_capture_sources() {
+        if !self.parks_idle_sources() {
             return;
         }
         let victims: Vec<String> = self
@@ -716,7 +705,7 @@ impl CaptureContext {
     pub fn park_all_sources_for_pause(&mut self) {
         #[cfg(target_os = "macos")]
         {
-            if !self.use_park_idle_capture_sources() {
+            if !self.parks_idle_sources() {
                 return;
             }
             self.park_other_sources(None);
@@ -1962,14 +1951,6 @@ impl CaptureContext {
 
         self.update_capture_state_flags();
         Ok(true)
-    }
-
-    /// Whether idle-source parking is active, so the engine knows a successful switch may have
-    /// restarted the incoming app's stream and its black-output memory needs invalidating.
-    /// Gated to match its only caller — the black-output ladder exists on macOS tray builds only.
-    #[cfg(all(target_os = "macos", not(no_tray)))]
-    pub fn parks_idle_sources(&self) -> bool {
-        self.use_park_idle_capture_sources()
     }
 
     /// Force a refresh of the current application capture source.
