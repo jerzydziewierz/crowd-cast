@@ -68,8 +68,21 @@ pub struct CaptureConfig {
     /// On macOS, keep only the frontmost tracked application's capture source active.
     /// This avoids running multiple ScreenCaptureKit application sources at once. Linux
     /// per-app capture uses the single-active path whenever it is supported.
+    ///
+    /// On macOS this is enforced by *parking* every source that is not frontmost: pointing it at
+    /// an uninstalled bundle id, so ScreenCaptureKit has nothing to hand it. Without parking the
+    /// setting would only choose which source gets composited — every tracked app's source would
+    /// still stream for the whole session and have its frames decoded and thrown away, at roughly
+    /// 1.8 points of `replayd` CPU each (PDOOM-1421).
+    ///
+    /// Parking is `obs_source_update` on an existing source — never a create or a destroy. Both
+    /// of those were measured unsafe here: a source created mid-recording delivered no frames,
+    /// and destroying seven sources during a live recording aborted the process inside the
+    /// ScreenCaptureKit delivery callback. Park/unpark measured clean in the same run:
+    /// full-brightness content back in under 0.1 s, with no black frame recorded at all.
     #[serde(default = "default_single_active_app_capture")]
     pub single_active_app_capture: bool,
+
 
     /// macOS multi-monitor / multi-Space capture: place the focused app/display at its real
     /// spatial position on a multi-monitor–normalized canvas (parity with Windows/Linux).
